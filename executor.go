@@ -2,11 +2,14 @@ package main
 
 import (
 	"bufio"
+	"time"
+	"sync/atomic"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"syscall"
 )
 
@@ -14,8 +17,9 @@ type Executor struct {
 	cmd      *exec.Cmd
 	exe      string
 	args     []string
-	running  bool
+	running  uint32
 	exitChan chan int
+	lock     sync.Mutex
 }
 
 func NewExecutor(cmdStr string) *Executor {
@@ -35,10 +39,11 @@ func NewExecutor(cmdStr string) *Executor {
 	}
 }
 
-func (e *Executor) printOutput(r io.Reader) {
+func (e *Executor) printOutput(r io.ReadCloser) {
+	defer r.Close()
+
 	reader := bufio.NewReader(r)
-	defer fmt.Println("stop print output")
-	for e.running {
+	for atomic.LoadUint32(&e.running) == 1 {
 		l, _, err := reader.ReadLine()
 		if err == io.EOF {
 			return
@@ -47,23 +52,33 @@ func (e *Executor) printOutput(r io.Reader) {
 			return
 		}
 
-		fmt.Printf(">>> %v\n", string(l))
+		fmt.Printf("\t%v\n", string(l))
 	}
 }
 
 func (e *Executor) Start() error {
-	e.running = true
+	if atomic.LoadUint32(&e.running) == 1 {
+		return fmt.Errorf("already start")
+	}
+	atomic.StoreUint32(&e.running, 1)
 	cmd := exec.Command(e.exe, e.args...)
 	r, w := io.Pipe()
 	cmd.Stdout = w
 	cmd.Stderr = w
 	cmd.Env = os.Environ()
 
+	e.lock.Lock()
 	e.cmd = cmd
+	e.lock.Unlock()
+
 	go e.printOutput(r)
 
 	go func() {
 		var code int
+
+		defer func ()  {
+			fmt.Printf("exit with status %v..\n", code)
+		}()
 		err := e.cmd.Run()
 		if err != nil {
 			code = 1
@@ -76,18 +91,21 @@ func (e *Executor) Start() error {
 			}
 		}
 		w.Close()
-		// r.Close()
-		e.running = false
-		// e.exitChan <- code
+		atomic.StoreUint32(&e.running, 0)
 		_ = code
+		e.lock.Lock()
 		e.cmd = nil
+		e.lock.Unlock()
 	}()
 
 	return nil
 }
 
 func (e *Executor) Stop() error {
-	if !e.running || e.cmd == nil || e.cmd.Process == nil {
+	e.lock.Lock()
+	defer e.lock.Unlock()
+
+	if atomic.LoadUint32(&e.running) == 0 || e.cmd == nil || e.cmd.Process == nil {
 		return nil
 	}
 
@@ -98,6 +116,10 @@ func (e *Executor) Restart() error {
 	err := e.Stop()
 	if err != nil {
 		return err
+	}
+	//wait†ˆng
+	for atomic.LoadUint32(&e.running) == 1 {
+		time.Sleep(time.Millisecond*100)
 	}
 	return e.Start()
 }
